@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EPUB Typing Reader - Expanded Skip</title>
+    <link href="https://fonts.googleapis.com/css2?family=Merriweather:wght@400;700&family=Lora:wght@400;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        /* Blinking Caret Animation */
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+        .caret {
+            display: inline-block;
+            width: 2px;
+            height: 1.2em;
+            background-color: currentColor;
+            vertical-align: text-bottom;
+            margin-left: -1px;
+            animation: blink 1s step-end infinite;
+            position: absolute;
+        }
+
+        /* General Layout */
+        body { margin: 0; padding: 0; box-sizing: border-box; }
+        .btn {
+            padding: 8px 14px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: opacity 0.2s;
+            white-space: nowrap;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- EPUB PARSING ---
+        const parseEPUB = async (file) => {
+            const zip = await JSZip.loadAsync(file);
+            const containerXml = await zip.file('META-INF/container.xml').async('text');
+            const containerDoc = new DOMParser().parseFromString(containerXml, 'text/xml');
+            const contentPath = containerDoc.querySelector('rootfile').getAttribute('full-path');
+            const contentDir = contentPath.substring(0, contentPath.lastIndexOf('/') + 1);
+            const contentXml = await zip.file(contentPath).async('text');
+            const contentDoc = new DOMParser().parseFromString(contentXml, 'text/xml');
+
+            const spineItems = Array.from(contentDoc.querySelectorAll('spine itemref'));
+            const manifest = {};
+            contentDoc.querySelectorAll('manifest item').forEach(item => {
+                manifest[item.getAttribute('id')] = item.getAttribute('href');
+            });
+
+            const chapters = [];
+            for (const item of spineItems) {
+                const href = manifest[item.getAttribute('idref')];
+                if (href) {
+                    try {
+                        const html = await zip.file(contentDir + href).async('text');
+                        const doc = new DOMParser().parseFromString(html, 'text/html');
+
+                        let title = doc.querySelector('title')?.textContent ||
+                                   doc.querySelector('h1, h2')?.textContent ||
+                                   `Chapter ${chapters.length + 1}`;
+
+                        const body = doc.querySelector('body');
+                        let text = '';
+                        if (body) {
+                            ['p', 'div', 'h1', 'h2', 'h3', 'li', 'blockquote'].forEach(tag => {
+                                const els = body.getElementsByTagName(tag);
+                                for(let el of els) el.innerHTML += '\n';
+                            });
+                            text = body.textContent;
+                            text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                            text = text.replace(/\n{3,}/g, '\n\n');
+                            text = text.trim();
+                        }
+
+                        if (text.length > 0) chapters.push({ title, text });
+                    } catch (e) { console.error(e); }
+                }
+            }
+            return chapters;
+        };
+
+        // Splitting text into ~100 word pages
+        const splitIntoChunks = (text, wordLimit = 100) => {
+            const parts = text.split(/(\s+)/);
+            const chunks = [];
+            let currentChunk = '';
+            let wordCount = 0;
+
+            for (let part of parts) {
+                currentChunk += part;
+                if (/\S/.test(part)) wordCount++;
+
+                if (wordCount >= wordLimit && part.includes('\n')) {
+                    chunks.push(currentChunk);
+                    currentChunk = '';
+                    wordCount = 0;
+                } else if (wordCount >= wordLimit * 1.2) {
+                    chunks.push(currentChunk);
+                    currentChunk = '';
+                    wordCount = 0;
+                }
+            }
+            if (currentChunk) chunks.push(currentChunk);
+            return chunks;
+        };
+
+        // --- THEMES ---
+        const THEMES = {
+            navy: { bg: '#1a2332', text: '#e0e6ed', accent: '#7c9fff', highlight: '#4a5568', dimmed: '#5c6b7f' },
+            light: { bg: '#ffffff', text: '#2d3748', accent: '#3182ce', highlight: '#edf2f7', dimmed: '#a0aec0' },
+            sepia: { bg: '#f4ecd8', text: '#5c4a2f', accent: '#8b4513', highlight: '#e8dcc0', dimmed: '#a89f91' },
+            dark: { bg: '#121212', text: '#e0e0e0', accent: '#bb86fc', highlight: '#2c2c2c', dimmed: '#555555' }
+        };
+
+        // --- MAIN APP ---
+        function App() {
+            const [book, setBook] = useState(null);
+            const [chapterIdx, setChapterIdx] = useState(0);
+            const [chunkIdx, setChunkIdx] = useState(0);
+            const [typed, setTyped] = useState('');
+
+            const [theme, setTheme] = useState(THEMES.navy);
+            const [fontSize, setFontSize] = useState(20);
+            const [showChapters, setShowChapters] = useState(false);
+
+            const inputRef = useRef(null);
+
+            // Load Progress
+            useEffect(() => {
+                const saved = localStorage.getItem('epub_progress_fixed_v4');
+                if (saved) {
+                    const data = JSON.parse(saved);
+                    if (data.book) setBook(data.book);
+                    setChapterIdx(data.chapterIdx || 0);
+                    setChunkIdx(data.chunkIdx || 0);
+                }
+            }, []);
+
+            // Save Progress
+            useEffect(() => {
+                if (book) {
+                    localStorage.setItem('epub_progress_fixed_v4', JSON.stringify({ book, chapterIdx, chunkIdx }));
+                }
+            }, [book, chapterIdx, chunkIdx]);
+
+            const handleUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                try {
+                    const rawChapters = await parseEPUB(file);
+                    const processed = rawChapters.map(ch => ({
+                        ...ch,
+                        chunks: splitIntoChunks(ch.text, 100)
+                    }));
+                    setBook(processed);
+                    setChapterIdx(0);
+                    setChunkIdx(0);
+                    setTyped('');
+                } catch (err) { alert(err.message); }
+            };
+
+            const loadNewBook = () => {
+                if (confirm("Load a new book? Your current progress will be cleared.")) {
+                    setBook(null);
+                    setChapterIdx(0);
+                    setChunkIdx(0);
+                    setTyped('');
+                    localStorage.removeItem('epub_progress_fixed_v4');
+                }
+            };
+
+            const nextChunk = () => {
+                if (!book) return;
+                const currentChapter = book[chapterIdx];
+                if (chunkIdx < currentChapter.chunks.length - 1) {
+                    setChunkIdx(c => c + 1);
+                    setTyped('');
+                } else if (chapterIdx < book.length - 1) {
+                    setChapterIdx(c => c + 1);
+                    setChunkIdx(0);
+                    setTyped('');
+                }
+            };
+
+            const prevChunk = () => {
+                if (chunkIdx > 0) {
+                    setChunkIdx(c => c - 1);
+                    setTyped('');
+                } else if (chapterIdx > 0) {
+                    setChapterIdx(c => c - 1);
+                    setChunkIdx(book[chapterIdx - 1].chunks.length - 1);
+                    setTyped('');
+                }
+            };
+
+            const jumpToChapter = (idx) => {
+                setChapterIdx(idx);
+                setChunkIdx(0);
+                setTyped('');
+                setShowChapters(false);
+            };
+
+            const handleInput = (e) => {
+                const val = e.target.value;
+                const currentText = getCurrentText();
+                if (val.length <= currentText.length) {
+                    setTyped(val);
+                    if (val.length === currentText.length) {
+                         setTimeout(nextChunk, 400);
+                    }
+                }
+            };
+
+            const handleKeyDown = (e) => {
+                // Handle arrow key navigation (Up/Down)
+                if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    
+                    const currentText = getCurrentText();
+                    const lines = currentText.split('\n');
+                    
+                    // Find which line the cursor is currently on
+                    let currentLineIdx = 0;
+                    let charsSoFar = 0;
+                    let positionInLine = typed.length;
+                    
+                    for (let i = 0; i < lines.length; i++) {
+                        const lineLength = lines[i].length;
+                        const includesNewline = i < lines.length - 1;
+                        const totalLength = lineLength + (includesNewline ? 1 : 0);
+                        
+                        // Use < instead of <= to handle cursor at exact line boundaries
+                        if (typed.length < charsSoFar + totalLength || i === lines.length - 1) {
+                            currentLineIdx = i;
+                            positionInLine = typed.length - charsSoFar;
+                            break;
+                        }
+                        charsSoFar += totalLength;
+                    }
+                    
+                    // Move to target line
+                    let targetLineIdx = currentLineIdx;
+                    if (e.key === 'ArrowUp' && currentLineIdx > 0) {
+                        targetLineIdx = currentLineIdx - 1;
+                    } else if (e.key === 'ArrowDown' && currentLineIdx < lines.length - 1) {
+                        targetLineIdx = currentLineIdx + 1;
+                    } else {
+                        return; // Can't move up from first line or down from last line
+                    }
+                    
+                    // Calculate new cursor position
+                    let newCursorPos = 0;
+                    for (let i = 0; i < targetLineIdx; i++) {
+                        newCursorPos += lines[i].length + 1; // +1 for newline
+                    }
+                    
+                    // Try to maintain same column position, but don't exceed line length
+                    const targetLineLength = lines[targetLineIdx].length;
+                    newCursorPos += Math.min(positionInLine, targetLineLength);
+                    
+                    // Update typed text to new cursor position
+                    setTyped(currentText.substring(0, newCursorPos));
+                }
+            };
+
+            const getCurrentText = () => {
+                if (!book) return '';
+                return book[chapterIdx].chunks[chunkIdx] || '';
+            };
+
+            // --- EXPANDED MATCHING LOGIC ---
+            const isMatch = (orig, typedChar) => {
+                if (!orig || !typedChar) return false;
+                if (orig === typedChar) return true;
+
+                // 1. Whitespace leniency (Enter/Space)
+                if ((orig === '\n' && typedChar === ' ') || (orig === ' ' && typedChar === '\n')) return true;
+
+                // 2. PUNCTUATION SKIP
+                // If user types SPACE, but orig is ANY punctuation, count as match.
+                // Regex Breakdown:
+                // \p{P} covers standard unicode punctuation.
+                // \p{S} covers symbols (like math symbols, currency).
+                // Explicit list adds: pipe |, dashes, underscores, quotes.
+                if (typedChar === ' ') {
+                     // Expanded Regex for skipping
+                     const skipRegex = /^[!"#$%&'()*+,\-./:;<=>?@[\]^_`{|}~—–…“”‘’«»•]$/;
+                     if (skipRegex.test(orig)) return true;
+                }
+
+                // 3. Punctuation Maps (Smart quotes etc - for when user DOES type them)
+                const map = { '“':'"', '”':'"', '‘':"'", '’':"'", '—':'-', '–':'-', '…':'...' };
+                if (map[orig] === typedChar) return true;
+
+                // 4. Normalize for Case & Accents
+                try {
+                    const normOrig = orig.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+                    const normTyped = typedChar.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+                    return normOrig === normTyped;
+                } catch (e) {
+                    return orig.toLowerCase() === typedChar.toLowerCase();
+                }
+            };
+
+            const renderText = () => {
+                const text = getCurrentText();
+                const lines = text.split('\n');
+                let globalIndex = 0;
+
+                return (
+                    <div
+                        style={{
+                            fontFamily: 'Merriweather, serif',
+                            lineHeight: '1.8',
+                            fontSize: `${fontSize}px`,
+                            whiteSpace: 'pre-wrap'
+                        }}
+                        onClick={() => inputRef.current?.focus()}
+                    >
+                        {lines.map((line, lineIdx) => {
+                            if (line.length === 0) {
+                                const isCurrent = globalIndex === typed.length;
+                                const charEl = (
+                                    <div key={lineIdx} style={{ height: '1em', position: 'relative' }}>
+                                        {isCurrent && <span className="caret" style={{ color: theme.accent }} />}
+                                    </div>
+                                );
+                                globalIndex++;
+                                return charEl;
+                            }
+
+                            const chars = line.split('').map((char, charIdx) => {
+                                const currentGlobal = globalIndex;
+                                globalIndex++;
+
+                                const isTyped = currentGlobal < typed.length;
+                                const isCurrent = currentGlobal === typed.length;
+                                const typedChar = typed[currentGlobal];
+                                const match = isTyped && isMatch(char, typedChar);
+
+                                return (
+                                    <span key={charIdx} style={{ position: 'relative' }}>
+                                        {isCurrent && <span className="caret" style={{ color: theme.accent }} />}
+                                        <span style={{
+                                            color: isTyped
+                                                ? (match ? theme.text : '#ef4444')
+                                                : theme.dimmed,
+                                            backgroundColor: (isTyped && !match) ? 'rgba(239, 68, 68, 0.1)' : 'transparent'
+                                        }}>
+                                            {char}
+                                        </span>
+                                    </span>
+                                );
+                            });
+
+                            const isLastLine = lineIdx === lines.length - 1;
+                            if (!isLastLine) {
+                                const currentGlobal = globalIndex;
+                                const isCurrent = currentGlobal === typed.length;
+                                globalIndex++;
+                                chars.push(
+                                    <span key="nl" style={{ position: 'relative' }}>
+                                        {isCurrent && <span className="caret" style={{ color: theme.accent }} />}
+                                        <span>&nbsp;</span>
+                                    </span>
+                                );
+                            }
+
+                            return <div key={lineIdx}>{chars}</div>;
+                        })}
+                    </div>
+                );
+            };
+
+            if (!book) return (
+                <div style={{ minHeight: '100vh', background: theme.bg, color: theme.text, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                    <h1 style={{ color: theme.accent, marginBottom: '20px' }}>EPUB Typing Reader</h1>
+                    <label className="btn" style={{ background: theme.accent, color: theme.bg, fontSize: '18px' }}>
+                        Upload Book (.epub)
+                        <input type="file" accept=".epub" onChange={handleUpload} style={{ display: 'none' }} />
+                    </label>
+                </div>
+            );
+
+            const currentChapter = book[chapterIdx];
+
+            return (
+                <div style={{ minHeight: '100vh', background: theme.bg, color: theme.text, display: 'flex', flexDirection: 'column' }}>
+
+                    {/* HEADER */}
+                    <div style={{ padding: '15px 20px', borderBottom: `1px solid ${theme.highlight}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '10px' }}>
+                        <div style={{ flex: 1 }}>
+                            <h2 style={{ margin: 0, fontSize: '18px', color: theme.accent }}>{currentChapter.title}</h2>
+                            <span style={{ fontSize: '12px', color: theme.dimmed }}>
+                                Page {chunkIdx + 1} of {currentChapter.chunks.length}
+                            </span>
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                            <button className="btn" style={{ background: theme.highlight, color: theme.text }} onClick={loadNewBook}>
+                                📂 Load New
+                            </button>
+                            <button className="btn" style={{ background: theme.highlight, color: theme.text }} onClick={() => setShowChapters(true)}>
+                                ≡ Chapters
+                            </button>
+                            <select
+                                className="btn"
+                                style={{ background: theme.highlight, color: theme.text }}
+                                onChange={(e) => setTheme(THEMES[e.target.value])}
+                            >
+                                {Object.keys(THEMES).map(t => <option key={t} value={t}>{t.toUpperCase()}</option>)}
+                            </select>
+                            <button className="btn" style={{ background: theme.highlight, color: theme.text }} onClick={() => setFontSize(f => Math.max(12, f-2))}>A-</button>
+                            <button className="btn" style={{ background: theme.highlight, color: theme.text }} onClick={() => setFontSize(f => Math.min(40, f+2))}>A+</button>
+                        </div>
+                    </div>
+
+                    {/* MAIN CONTENT */}
+                    <div style={{ flex: 1, overflowY: 'auto', padding: '40px 20px', maxWidth: '800px', margin: '0 auto', width: '100%' }}>
+                        {renderText()}
+                        <textarea
+                            ref={inputRef}
+                            value={typed}
+                            onChange={handleInput}
+                            onKeyDown={handleKeyDown}
+                            autoFocus
+                            style={{ position: 'fixed', top: '-9999px', left: '-9999px', opacity: 0 }}
+                        />
+                    </div>
+
+                    {/* FOOTER */}
+                    <div style={{ padding: '20px', borderTop: `1px solid ${theme.highlight}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: theme.bg }}>
+                        <button className="btn" onClick={prevChunk} disabled={chunkIdx === 0 && chapterIdx === 0} style={{ background: theme.highlight, color: theme.text }}>
+                            ← Prev
+                        </button>
+                        <div style={{ textAlign: 'center', fontSize: '14px' }}>
+                            <span style={{ color: theme.dimmed }}>Progress: </span>
+                            <span style={{ color: theme.accent, fontWeight: 'bold' }}>
+                                {Math.round((typed.length / getCurrentText().length) * 100)}%
+                            </span>
+                        </div>
+                        <button className="btn" onClick={nextChunk} style={{ background: theme.accent, color: theme.bg }}>
+                            Next →
+                        </button>
+                    </div>
+
+                    {/* MODAL */}
+                    {showChapters && (
+                        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.8)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 100 }} onClick={() => setShowChapters(false)}>
+                            <div style={{ background: theme.bg, width: '90%', maxWidth: '500px', maxHeight: '80vh', overflowY: 'auto', borderRadius: '8px', padding: '20px' }} onClick={e => e.stopPropagation()}>
+                                <h3 style={{ marginTop: 0, color: theme.accent }}>Table of Contents</h3>
+                                {book.map((ch, idx) => (
+                                    <div
+                                        key={idx}
+                                        onClick={() => jumpToChapter(idx)}
+                                        style={{
+                                            padding: '12px',
+                                            cursor: 'pointer',
+                                            borderBottom: `1px solid ${theme.highlight}`,
+                                            color: idx === chapterIdx ? theme.accent : theme.text,
+                                            background: idx === chapterIdx ? theme.highlight : 'transparent'
+                                        }}
+                                    >
+                                        {idx + 1}. {ch.title}
+                                    </div>
+                                ))}
+                                <button className="btn" style={{ marginTop: '20px', width: '100%', background: theme.highlight, color: theme.text }} onClick={() => setShowChapters(false)}>Close</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
